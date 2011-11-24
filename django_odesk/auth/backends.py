@@ -11,6 +11,7 @@ from django_odesk.auth.models import get_user_model
 from django_odesk.conf import settings
 from django_odesk.core.clients import DefaultClient
 
+
 class OdeskUser(object):
 
     # Django authentication system uses only `user_id` value to get
@@ -72,9 +73,8 @@ class OdeskUser(object):
         return full_name.strip()
 
 
-
 class SimpleBackend(object):
-    
+
     def __init__(self):
         self.client = None
         self.api_token = None
@@ -107,7 +107,7 @@ class SimpleBackend(object):
 class BaseModelBackend(ModelBackend):
 
     create_unknown_user = True
-    
+
     def __init__(self, *args, **kwargs):
         super(BaseModelBackend, self).__init__(*args, **kwargs)
         self.api_token = None
@@ -139,7 +139,7 @@ class BaseModelBackend(ModelBackend):
         return user
 
     def clean_username(self, auth_user):
-        return auth_user['mail']
+        return auth_user['uid'] + u'@odesk.com'
 
     def configure_user(self, user, auth_user):
         return user
@@ -183,32 +183,34 @@ class ModelBackend(BaseModelBackend):
 
 class TeamAuthBackend(ModelBackend):
 
-    def sync_django_groups(self, user, userteams):
-        """
-        Assign existing `Group`s with userteam names to `user.groups`
-        """
+    GROUP_SUFFIX = u'@odesk.com'  # used to distinguish oDesk and Django groups
+
+    def _clear_groups(self, user):
         from django.db import connection
+        sql = u"DELETE FROM auth_user_groups WHERE user_id=%s AND group_id IN \
+                (SELECT id FROM auth_group WHERE name LIKE '%%@odesk.com')"
+        cursor = connection.cursor()
+        cursor.execute(sql, (user.id, ))
 
-        def clear_groups(user):
+    def _bulk_groups_insert(self, user_id, group_ids):
+        from django.db import connection
+        sql = "INSERT INTO auth_user_groups (user_id, group_id) VALUES %s"
+        values = zip([user_id] * len(group_ids), group_ids)
+        if values:
+            sql_values = ','.join("(%i,%i)" % v for v in values)
             cursor = connection.cursor()
-            cursor.execute("DELETE FROM auth_user_groups WHERE user_id=%s", (user.id,))
+            cursor.execute(sql % sql_values)
 
-        def bulk_groups_insert(user, groups_query):
-            group_ids = filter(lambda gid: gid is not None,
-                               (grp.get('id') for grp in groups_query.values('id')))
-            values = zip([user.id]*len(group_ids), group_ids)
-            if len(values) > 0:
-                sql_values = ','.join("(%i,%i)" % v for v in values)
-                cursor = connection.cursor()
-                cursor.execute("INSERT INTO auth_user_groups (user_id, group_id) VALUES %s" % sql_values)
-
-        @transaction.commit_on_success
-        def run_in_tx():
-            clear_groups(user)
-            bulk_groups_insert(user, Group.objects.filter(name__in=userteams))
-
-        run_in_tx()
-
+    @transaction.commit_on_success
+    def sync_django_groups(self, user, userteams):
+        """Updates associations between existing Django groups and user.
+        :param user: instance of django.contrib.auth.models.User
+        :param userteams: list of user teams on oDesk
+        """
+        self._clear_groups(user)
+        groups = Group.objects.filter(name__in=userteams)
+        group_ids = groups.values_list('id', flat=True)
+        self._bulk_groups_insert(user.id, group_ids)
 
     def authenticate(self, token=None):
         client = DefaultClient(token)
@@ -223,8 +225,9 @@ class TeamAuthBackend(ModelBackend):
         username = self.clean_username(auth_user)
         model = get_user_model()
 
-        userteams = set(team[u'id'] for team in client.hr.get_teams())
-        # TODO authorize subteams of parents in ODESK_AUTH_TEAMS
+        userteams = set(team[u'id'] + self.GROUP_SUFFIX for team in \
+            client.hr.get_teams())
+
         auth_teams = userteams.intersection(set(settings.ODESK_AUTH_TEAMS))
 
         if auth_teams or username in settings.ODESK_AUTH_USERS:
@@ -242,19 +245,20 @@ class TeamAuthBackend(ModelBackend):
 
                 self.sync_django_groups(user, auth_teams)
 
-                if userteams.intersection(set(settings.ODESK_AUTH_ADMIN_TEAMS)) or \
-                   username in settings.ODESK_ADMINS:
-                    user.is_staff=True
+                if userteams.intersection(set(settings.ODESK_AUTH_ADMIN_TEAMS)) \
+                    or username in settings.ODESK_ADMINS:
+                    user.is_staff = True
                 else:
-                    user.is_staff=False
+                    user.is_staff = False
 
-                if userteams.intersection(set(settings.ODESK_AUTH_SUPERUSER_TEAMS)) or \
-                   username in settings.ODESK_SUPERUSERS:
-                    user.is_superuser=True
+                if userteams.intersection(set(settings.ODESK_AUTH_SUPERUSER_TEAMS)) \
+                    or username in settings.ODESK_SUPERUSERS:
+                    user.is_superuser = True
                 else:
-                    user.is_superuser=False
+                    user.is_superuser = False
 
-                # attach api_token to user instance, so it can be passed to post_save signal handler
+                # attach api_token to user instance,
+                # so it can be passed to post_save signal handler
                 user.odesk_api_token = api_token
                 user.save()
 

@@ -1,5 +1,8 @@
 VERSION = (0, 0, 2, 'alpha', 1)
 
+# make models importable by Django
+from . import models
+
 def get_version():
     version = '%s.%s' % (VERSION[0], VERSION[1])
     if VERSION[2]:
@@ -12,3 +15,4 @@ def get_version():
             if VERSION[4] != 0:
                 version = '%s %s' % (version, VERSION[4])
     return version
+
